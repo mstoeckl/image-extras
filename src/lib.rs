@@ -18,10 +18,18 @@
 #[cfg(feature = "pcx")]
 pub mod pcx;
 
+#[cfg(feature = "xbm")]
+pub mod xbm;
+
 /// Register all enabled extra formats with the image crate.
 pub fn register() {
     image::hooks::register_decoding_hook(
         image::ImageFormat::Pcx,
         Box::new(|r| Ok(Box::new(pcx::PCXDecoder::new(r)?))),
+    );
+    #[cfg(feature = "xbm")]
+    image::hooks::register_decoding_hook(
+        image::ImageFormat::Xbm,
+        Box::new(|r| Ok(Box::new(xbm::XbmDecoder::new(r)?))),
     );
 }

@@ -8,16 +8,15 @@ publish = false
 include = ["src", "tests/reference.rs"]
 
 [features]
-default = ["pcx"]
+default = ["pcx", "xbm"]
 pcx = []
+xbm = []
 
 [dependencies]
-image = { version = "0.25.5", default-features = false }
+image = {  git = "https://github.com/mstoeckl/image", branch = "xbm-hook", default-features = false }
 pcx = "0.2.4"
 
 [dev-dependencies]
-image = { version = "0.25.5", default-features = false, features = ["png"] }
+image = {  git = "https://github.com/mstoeckl/image", branch = "xbm-hook", default-features = false, features = ["png"] }
 walkdir = "2.5.0"
 
-[patch.crates-io]
-image = { git = "https://github.com/fintelia/image", branch = "decoding-hooks" }
