@@ -8,12 +8,16 @@ publish = false
 include = ["src", "tests/reference.rs"]
 
 [features]
-default = ["pcx"]
+default = ["pcx", "psd"]
 pcx = ["dep:pcx"]
+psd = ["dep:zune-psd", "dep:zune-core", "dep:bytemuck"]
 
 [dependencies]
 image = { version = "0.25.8", default-features = false }
 pcx = { version = "0.2.4", optional = true }
+zune-psd = { version = "0.4.0", optional = true }
+zune-core = { version = "0.4.12", default-features = false, optional = true }
+bytemuck = { version = "1.8.0", optional = true }
 
 [dev-dependencies]
 image = { version = "0.25.8", default-features = false, features = ["png"] }
