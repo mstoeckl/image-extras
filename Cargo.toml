@@ -24,7 +24,7 @@ xpm = []
 
 
 [dependencies]
-image = { version = "0.25.8", default-features = false }
+image = { version = "0.25.9", default-features = false }
 
 # Optional dependencies
 ouroboros = { version = "0.18.5", optional = true }
@@ -33,5 +33,8 @@ wbmp = { version = "0.1.2", optional = true }
 zip = { version = "5.1.1", default-features = false, features = ["deflate"], optional = true }
 
 [dev-dependencies]
-image = { version = "0.25.8", default-features = false, features = ["png", "tiff"] }
+image = { version = "0.25.9", default-features = false, features = ["png", "tiff"] }
 walkdir = "2.5.0"
+
+[patch.crates-io]
+image = { git = "https://github.com/mstoeckl/image", branch = "deco-meta-inf" }

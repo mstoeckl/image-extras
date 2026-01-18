@@ -51,24 +51,19 @@ pub fn register() {
         #[cfg(feature = "ora")]
         register_decoding_hook(
             "ora".into(),
-            Box::new(|r| {
-                Ok(Box::new(ora::OpenRasterDecoder::with_limits(
-                    r,
-                    image::Limits::no_limits(),
-                )?))
-            }),
+            Box::new(|r| Ok(Box::new(ora::OpenRasterDecoder::new(r)))),
         );
 
         #[cfg(feature = "otb")]
         image::hooks::register_decoding_hook(
             "otb".into(),
-            Box::new(|r| Ok(Box::new(otb::OtbDecoder::new(r)?))),
+            Box::new(|r| Ok(Box::new(otb::OtbDecoder::new(r)))),
         );
 
         #[cfg(feature = "pcx")]
         if register_decoding_hook(
             "pcx".into(),
-            Box::new(|r| Ok(Box::new(pcx::PCXDecoder::new(r)?))),
+            Box::new(|r| Ok(Box::new(pcx::PCXDecoder::new(r)))),
         ) {
             register_format_detection_hook("pcx".into(), &[0x0a, 0x0], Some(b"\xFF\xF8"));
         }
@@ -85,7 +80,7 @@ pub fn register() {
                 image::hooks::GenericReader<'a>,
             )
                 -> image::ImageResult<Box<dyn image::ImageDecoder + 'a>> =
-                |r| Ok(Box::new(sgi::SgiDecoder::new(r)?));
+                |r| Ok(Box::new(sgi::SgiDecoder::new(r)));
             image::hooks::register_decoding_hook("bw".into(), Box::new(hook));
             image::hooks::register_decoding_hook("rgb".into(), Box::new(hook));
             image::hooks::register_decoding_hook("rgba".into(), Box::new(hook));
@@ -127,18 +122,18 @@ pub fn register() {
         {
             register_decoding_hook(
                 "xbm".into(),
-                Box::new(|r| Ok(Box::new(xbm::XbmDecoder::new(r)?))),
+                Box::new(|r| Ok(Box::new(xbm::XbmDecoder::new(r)))),
             );
             register_decoding_hook(
                 "bm".into(),
-                Box::new(|r| Ok(Box::new(xbm::XbmDecoder::new(r)?))),
+                Box::new(|r| Ok(Box::new(xbm::XbmDecoder::new(r)))),
             );
         }
 
         #[cfg(feature = "xpm")]
         if register_decoding_hook(
             "xpm".into(),
-            Box::new(|r| Ok(Box::new(xpm::XpmDecoder::new(r)?))),
+            Box::new(|r| Ok(Box::new(xpm::XpmDecoder::new(r)))),
         ) {
             register_format_detection_hook("xpm".into(), b"/* XPM */", None);
         }

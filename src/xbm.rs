@@ -13,7 +13,8 @@ use std::fmt;
 use std::io::{BufRead, Bytes};
 
 use image::error::{DecodingError, ImageFormatHint, ParameterError, ParameterErrorKind};
-use image::{ColorType, ExtendedColorType, ImageDecoder, ImageError, ImageResult};
+use image::io::{DecodedImageAttributes, DecodedMetadataHint, DecoderAttributes};
+use image::{ColorType, ExtendedColorType, ImageDecoder, ImageError, ImageLayout, ImageResult};
 
 /// Location of a byte in the input stream.
 ///
@@ -125,9 +126,16 @@ where
     }
 }
 
+/// XBM decoder lifecycle state
+enum XbmDecoderState<R> {
+    Init(R),
+    Header(XbmStreamDecoder<IoAdapter<R>>),
+    Done,
+}
+
 /// XBM decoder (usable wrapper of XbmStreamDecoder that handles IO errors)
 pub struct XbmDecoder<R> {
-    base: XbmStreamDecoder<IoAdapter<R>>,
+    state: XbmDecoderState<R>,
 }
 
 /// Part of the XBM file in which a parse error occurs
@@ -579,43 +587,85 @@ where
     R: BufRead,
 {
     /// Create a new `XBMDecoder`.
-    pub fn new(reader: R) -> Result<XbmDecoder<R>, ImageError> {
-        match XbmStreamDecoder::new(IoAdapter {
-            reader: reader.bytes(),
-            error: None,
-        }) {
-            Err((mut r, e)) => Err(e).apply_after(&mut r.error),
-            Ok(x) => Ok(XbmDecoder { base: x }),
+    pub fn new(reader: R) -> XbmDecoder<R> {
+        XbmDecoder {
+            state: XbmDecoderState::Init(reader),
         }
     }
 
     /// Returns the (x,y) hotspot coordinates of the image, if the image provides them.
-    pub fn hotspot(&self) -> Option<(i32, i32)> {
-        self.base.header.hotspot
+    /// Must be called _after_ peek_image()
+    pub fn hotspot(&self) -> ImageResult<Option<(i32, i32)>> {
+        let XbmDecoderState::Header(base) = &self.state else {
+            return Err(ImageError::Parameter(ParameterError::from_kind(
+                ParameterErrorKind::Generic("Need to call peek_layout() first".into()),
+            )));
+        };
+
+        Ok(base.header.hotspot)
     }
 }
 
 impl<R: BufRead> ImageDecoder for XbmDecoder<R> {
-    fn dimensions(&self) -> (u32, u32) {
-        (self.base.header.width, self.base.header.height)
+    fn peek_layout(&mut self) -> ImageResult<ImageLayout> {
+        if matches!(self.state, XbmDecoderState::Init(_)) {
+            let XbmDecoderState::Init(r) =
+                std::mem::replace(&mut self.state, XbmDecoderState::Done)
+            else {
+                unreachable!();
+            };
+            match XbmStreamDecoder::new(IoAdapter {
+                reader: r.bytes(),
+                error: None,
+            }) {
+                Err((mut r, e)) => {
+                    return Err(e).apply_after(&mut r.error);
+                }
+                Ok(base) => {
+                    self.state = XbmDecoderState::Header(base);
+                }
+            }
+        }
+        let XbmDecoderState::Header(base) = &self.state else {
+            return Err(ImageError::Parameter(ParameterError::from_kind(
+                ParameterErrorKind::NoMoreData,
+            )));
+        };
+
+        Ok(ImageLayout {
+            color: ColorType::L8,
+            width: base.header.width,
+            height: base.header.height,
+        })
     }
-    fn color_type(&self) -> ColorType {
-        ColorType::L8
+    fn original_color_type(&mut self) -> ImageResult<ExtendedColorType> {
+        Ok(ExtendedColorType::L1)
     }
-    fn original_color_type(&self) -> ExtendedColorType {
-        ExtendedColorType::L1
+
+    fn attributes(&self) -> DecoderAttributes {
+        let mut attrib = DecoderAttributes::default();
+        attrib.icc = DecodedMetadataHint::None;
+        attrib.exif = DecodedMetadataHint::None;
+        attrib.xmp = DecodedMetadataHint::None;
+        attrib.iptc = DecodedMetadataHint::None;
+        attrib
     }
-    fn read_image(mut self, buf: &mut [u8]) -> ImageResult<()>
+
+    fn read_image(&mut self, buf: &mut [u8]) -> ImageResult<DecodedImageAttributes>
     where
         Self: Sized,
     {
-        for row in buf.chunks_exact_mut(self.base.header.width as usize) {
+        self.peek_layout()?;
+        let XbmDecoderState::Header(mut base) =
+            std::mem::replace(&mut self.state, XbmDecoderState::Done)
+        else {
+            unreachable!();
+        };
+
+        for row in buf.chunks_exact_mut(base.header.width as usize) {
             // The XBM format discards the last `8 * ceil(self.width / 8) - self.width` bits in each row
             for chunk in row.chunks_mut(8) {
-                let nxt = self
-                    .base
-                    .next_byte()
-                    .apply_after(&mut self.base.r.inner.error)?;
+                let nxt = base.next_byte().apply_after(&mut base.r.inner.error)?;
                 let val = nxt.ok_or_else(|| {
                     ImageError::Parameter(ParameterError::from_kind(
                         ParameterErrorKind::DimensionMismatch,
@@ -628,20 +678,14 @@ impl<R: BufRead> ImageDecoder for XbmDecoder<R> {
             }
         }
 
-        let val = self
-            .base
-            .next_byte()
-            .apply_after(&mut self.base.r.inner.error)?;
+        let val = base.next_byte().apply_after(&mut base.r.inner.error)?;
         if val.is_some() {
             return Err(ImageError::Parameter(ParameterError::from_kind(
                 ParameterErrorKind::DimensionMismatch,
             )));
         }
 
-        Ok(())
-    }
-    fn read_image_boxed(self: Box<Self>, buf: &mut [u8]) -> ImageResult<()> {
-        (*self).read_image(buf)
+        Ok(DecodedImageAttributes::default())
     }
 }
 
@@ -653,23 +697,33 @@ mod tests {
 
     #[test]
     fn image_without_hotspot() {
-        let decoder = XbmDecoder::new(BufReader::new(
+        let mut decoder = XbmDecoder::new(BufReader::new(
             File::open("tests/images/xbm/1x1.xbm").unwrap(),
-        ))
-        .expect("Unable to read XBM file");
+        ));
+        let layout = decoder.peek_layout().expect("Unable to read XBM file");
 
-        assert_eq!((1, 1), decoder.dimensions());
-        assert_eq!(None, decoder.hotspot());
+        assert_eq!((1, 1), (layout.width, layout.height));
+        assert_eq!(
+            None,
+            decoder
+                .hotspot()
+                .expect("Hotspot evaluated at correct time")
+        );
     }
 
     #[test]
     fn image_with_hotspot() {
-        let decoder = XbmDecoder::new(BufReader::new(
+        let mut decoder = XbmDecoder::new(BufReader::new(
             File::open("tests/images/xbm/hotspot.xbm").unwrap(),
-        ))
-        .expect("Unable to read XBM file");
+        ));
+        let layout = decoder.peek_layout().expect("Unable to read XBM file");
 
-        assert_eq!((5, 5), decoder.dimensions());
-        assert_eq!(Some((-1, 2)), decoder.hotspot());
+        assert_eq!((5, 5), (layout.width, layout.height));
+        assert_eq!(
+            Some((-1, 2)),
+            decoder
+                .hotspot()
+                .expect("Hotspot evaluated at correct time")
+        );
     }
 }

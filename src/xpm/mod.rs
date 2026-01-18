@@ -54,9 +54,10 @@ use std::fmt;
 use std::io::{BufRead, Bytes};
 
 use image::error::{
-    DecodingError, ImageError, ImageFormatHint, ImageResult, LimitError, LimitErrorKind,
+    DecodingError, ImageError, ImageFormatHint, ImageResult, ParameterError, ParameterErrorKind,
 };
-use image::{ColorType, ImageDecoder, LimitSupport, Limits};
+use image::io::{DecodedImageAttributes, DecodedMetadataHint, DecoderAttributes};
+use image::{ColorType, ImageDecoder, ImageLayout, LimitSupport, Limits};
 
 /// Maximum length of an X11/CSS/etc. color name is 20; and of an RGB color is 13
 const MAX_COLOR_NAME_LEN: usize = 32;
@@ -153,10 +154,20 @@ where
     }
 }
 
+/// XPM decoder lifecycle state
+enum XpmDecoderState<R> {
+    Init(R),
+    Header {
+        r: TextReader<IoAdapter<R>>,
+        info: XpmHeaderInfo,
+    },
+    Done,
+}
+
 /// XPM decoder
 pub struct XpmDecoder<R> {
-    r: TextReader<IoAdapter<R>>,
-    info: XpmHeaderInfo,
+    state: XpmDecoderState<R>,
+    limits: Limits,
 }
 
 /// Key XPM file properties determined from first line
@@ -969,15 +980,11 @@ where
     R: BufRead,
 {
     /// Create a new [XpmDecoder].
-    pub fn new(reader: R) -> Result<XpmDecoder<R>, ImageError> {
-        let mut r = TextReader::new(IoAdapter {
-            reader: reader.bytes(),
-            error: None,
-        });
-
-        let info = read_xpm_header(&mut r).apply_after(&mut r.inner.error)?;
-
-        Ok(XpmDecoder { r, info })
+    pub fn new(reader: R) -> XpmDecoder<R> {
+        XpmDecoder {
+            state: XpmDecoderState::Init(reader),
+            limits: Limits::no_limits(),
+        }
     }
 }
 
@@ -995,72 +1002,95 @@ fn handle_key_color(key: &XpmVisual, color: &[u8]) -> Result<Option<[u16; 4]>, X
 }
 
 impl<R: BufRead> ImageDecoder for XpmDecoder<R> {
-    fn dimensions(&self) -> (u32, u32) {
-        (self.info.width, self.info.height)
+    fn peek_layout(&mut self) -> ImageResult<ImageLayout> {
+        if matches!(self.state, XpmDecoderState::Init(_)) {
+            let XpmDecoderState::Init(r) =
+                std::mem::replace(&mut self.state, XpmDecoderState::Done)
+            else {
+                unreachable!();
+            };
+
+            let mut tr = TextReader::new(IoAdapter {
+                reader: r.bytes(),
+                error: None,
+            });
+
+            let info = read_xpm_header(&mut tr).apply_after(&mut tr.inner.error)?;
+            self.state = XpmDecoderState::Header { r: tr, info };
+        }
+        let XpmDecoderState::Header { r: _, info } = &self.state else {
+            return Err(ImageError::Parameter(ParameterError::from_kind(
+                ParameterErrorKind::NoMoreData,
+            )));
+        };
+
+        Ok(ImageLayout {
+            // note: some images specify 16-bpc colors, and fully transparent pixels are possible,
+            // so RGBA16 is needed to handle all possible cases
+            color: ColorType::Rgba16,
+            width: info.width,
+            height: info.height,
+        })
     }
-    fn color_type(&self) -> ColorType {
-        // note: some images specify 16-bpc colors, and fully transparent pixels are possible,
-        // so RGBA16 is needed to handle all possible cases
-        ColorType::Rgba16
+
+    fn attributes(&self) -> DecoderAttributes {
+        let mut attrib = DecoderAttributes::default();
+        attrib.icc = DecodedMetadataHint::None;
+        attrib.exif = DecodedMetadataHint::None;
+        attrib.xmp = DecodedMetadataHint::None;
+        attrib.iptc = DecodedMetadataHint::None;
+        attrib
     }
-    fn read_image(mut self, buf: &mut [u8]) -> ImageResult<()>
+
+    fn read_image(&mut self, buf: &mut [u8]) -> ImageResult<DecodedImageAttributes>
     where
         Self: Sized,
     {
-        assert!(1 <= self.info.cpp && self.info.cpp <= 8);
+        let layout = self.peek_layout()?;
+        assert!(buf.len() as u64 == layout.total_bytes());
+        self.limits.check_dimensions(layout.width, layout.height)?;
 
-        let palette =
-            read_xpm_palette(&mut self.r, &self.info).apply_after(&mut self.r.inner.error)?;
+        let mut frame_limits = self.limits.clone();
+        // TODO: remove this once `buf` accounted for externally
+        frame_limits.reserve_usize(buf.len())?;
+
+        let XpmDecoderState::Header { mut r, info } =
+            std::mem::replace(&mut self.state, XpmDecoderState::Done)
+        else {
+            unreachable!();
+        };
+
+        assert!(1 <= info.cpp && info.cpp <= 8);
+
+        let max_table_bytes = u64::from(info.ncolors)
+            * u64::try_from(size_of::<XpmColorCodeEntry>()).expect("usize -> u64");
+        frame_limits.reserve(max_table_bytes)?;
+
+        let palette = read_xpm_palette(&mut r, &info).apply_after(&mut r.inner.error)?;
 
         // Read main image contents
-        let stride = (self.info.width as usize).checked_mul(8).unwrap();
+        let stride = (info.width as usize).checked_mul(8).unwrap();
         for (i, row) in buf.chunks_exact_mut(stride).enumerate() {
             for chunk in row.chunks_exact_mut(8) {
-                read_xpm_pixel(&mut self.r, &self.info, &palette, chunk.try_into().unwrap())
-                    .apply_after(&mut self.r.inner.error)?;
+                read_xpm_pixel(&mut r, &info, &palette, chunk.try_into().unwrap())
+                    .apply_after(&mut r.inner.error)?;
             }
 
-            if i >= (self.info.height - 1) as usize {
+            if i >= (info.height - 1) as usize {
                 // Last row,
             } else {
-                read_xpm_row_transition(&mut self.r).apply_after(&mut self.r.inner.error)?;
+                read_xpm_row_transition(&mut r).apply_after(&mut r.inner.error)?;
             }
         }
 
-        read_xpm_trailing(&mut self.r).apply_after(&mut self.r.inner.error)?;
+        read_xpm_trailing(&mut r).apply_after(&mut r.inner.error)?;
 
-        Ok(())
-    }
-    fn read_image_boxed(self: Box<Self>, buf: &mut [u8]) -> ImageResult<()> {
-        (*self).read_image(buf)
+        Ok(DecodedImageAttributes::default())
     }
 
     fn set_limits(&mut self, limits: Limits) -> ImageResult<()> {
         limits.check_support(&LimitSupport::default())?;
-        let (width, height) = self.dimensions();
-        limits.check_dimensions(width, height)?;
-
-        let max_pixels = u64::from(self.info.width) * u64::from(self.info.height);
-        let max_image_bytes =
-            max_pixels
-                .checked_mul(8)
-                .ok_or(ImageError::Limits(LimitError::from_kind(
-                    LimitErrorKind::DimensionError,
-                )))?;
-
-        let max_table_bytes = (self.info.ncolors as u64) * (size_of::<XpmColorCodeEntry>() as u64);
-        let max_bytes = max_image_bytes
-            .checked_add(max_table_bytes)
-            .ok_or(ImageError::Limits(LimitError::from_kind(
-                LimitErrorKind::InsufficientMemory,
-            )))?;
-
-        let max_alloc = limits.max_alloc.unwrap_or(u64::MAX);
-        if max_alloc < max_bytes {
-            return Err(ImageError::Limits(LimitError::from_kind(
-                LimitErrorKind::InsufficientMemory,
-            )));
-        }
+        self.limits = limits;
         Ok(())
     }
 }
@@ -1076,8 +1106,9 @@ static char *test[] = {
 \"20 5 10 1\",
 };
 ";
-        let decoder = XpmDecoder::new(&data[..]).unwrap();
-        let mut image = vec![0; decoder.total_bytes() as usize];
+        let mut decoder = XpmDecoder::new(&data[..]);
+        let layout = decoder.peek_layout().unwrap();
+        let mut image = vec![0; layout.total_bytes() as usize];
         assert!(decoder.read_image(&mut image).is_err());
     }
 
@@ -1089,8 +1120,9 @@ static char *test[] = {
     \"  c Antique White1\",
     \" \",
 };";
-        let decoder = XpmDecoder::new(&data[..]).unwrap();
-        let mut image = vec![0; decoder.total_bytes() as usize];
+        let mut decoder = XpmDecoder::new(&data[..]);
+        let layout = decoder.peek_layout().unwrap();
+        let mut image = vec![0; layout.total_bytes() as usize];
         assert!(decoder.read_image(&mut image).is_err());
     }
 
@@ -1102,12 +1134,14 @@ static char *test[] = {
         \"  c none\",
         \" \",
     };";
-        let decoder = XpmDecoder::new(&data[..data.len() - 1]).unwrap();
-        let mut image = vec![0; decoder.total_bytes() as usize];
+        let mut decoder = XpmDecoder::new(&data[..data.len() - 1]);
+        let layout = decoder.peek_layout().unwrap();
+        let mut image = vec![0; layout.total_bytes() as usize];
         assert!(decoder.read_image(&mut image).is_err());
 
-        let decoder = XpmDecoder::new(&data[..]).unwrap();
-        let mut image = vec![0; decoder.total_bytes() as usize];
+        let mut decoder = XpmDecoder::new(&data[..]);
+        let layout = decoder.peek_layout().unwrap();
+        let mut image = vec![0; layout.total_bytes() as usize];
         assert!(decoder.read_image(&mut image).is_ok());
     }
 }

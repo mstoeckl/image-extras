@@ -38,6 +38,12 @@ fn test_decoding() {
 
         let img = match image::open(entry.path()) {
             Ok(i) => i,
+            Err(image::ImageError::Unsupported(e)) => {
+                // Do not fail when an image is unsupported, because this can happen
+                // if not all decoders' features are enabled
+                println!("UNSUPPORTED {}: {}", entry.path().display(), e);
+                continue;
+            }
             Err(e) => {
                 add_error(&format!("Cannot decode image: {e}"));
                 continue;

@@ -11,7 +11,10 @@ use std::io::{BufRead, Seek, Write};
 use image::error::{
     DecodingError, EncodingError, ImageFormatHint, UnsupportedError, UnsupportedErrorKind,
 };
-use image::{ColorType, ExtendedColorType, ImageDecoder, ImageEncoder, ImageError, ImageResult};
+use image::io::DecodedImageAttributes;
+use image::{
+    ColorType, ExtendedColorType, ImageDecoder, ImageEncoder, ImageError, ImageLayout, ImageResult,
+};
 
 /// Encoder for Wbmp images.
 pub struct WbmpEncoder<W> {
@@ -61,7 +64,6 @@ impl<W: Write> ImageEncoder for WbmpEncoder<W> {
 
 /// Decoder for Wbmp images.
 pub struct WbmpDecoder<R> {
-    dimensions: (u32, u32),
     inner: wbmp::Decoder<R>,
 }
 
@@ -72,34 +74,34 @@ where
     /// Create a new `WbmpDecoder`.
     pub fn new(r: R) -> Result<WbmpDecoder<R>, ImageError> {
         let inner = wbmp::Decoder::new(r).map_err(convert_wbmp_error)?;
-        let dimensions = inner.dimensions();
 
-        Ok(WbmpDecoder { dimensions, inner })
+        Ok(WbmpDecoder { inner })
     }
 }
 
 impl<R: BufRead + Seek> ImageDecoder for WbmpDecoder<R> {
-    fn dimensions(&self) -> (u32, u32) {
-        self.dimensions
+    fn peek_layout(&mut self) -> ImageResult<ImageLayout> {
+        let dimensions = self.inner.dimensions();
+        Ok(ImageLayout {
+            color: ColorType::L8,
+            width: dimensions.0,
+            height: dimensions.1,
+        })
     }
 
-    fn color_type(&self) -> ColorType {
-        ColorType::L8
+    fn original_color_type(&mut self) -> ImageResult<ExtendedColorType> {
+        Ok(ExtendedColorType::L1)
     }
 
-    fn original_color_type(&self) -> ExtendedColorType {
-        ExtendedColorType::L1
-    }
-
-    fn read_image(mut self, buf: &mut [u8]) -> ImageResult<()> {
-        let (width, height) = self.dimensions;
+    fn read_image(&mut self, buf: &mut [u8]) -> ImageResult<DecodedImageAttributes> {
+        let (width, height) = self.inner.dimensions();
         assert_eq!(buf.len(), (width * height) as usize, "Invalid buffer size");
 
-        self.inner.read_image_data(buf).map_err(convert_wbmp_error)
-    }
+        self.inner
+            .read_image_data(buf)
+            .map_err(convert_wbmp_error)?;
 
-    fn read_image_boxed(self: Box<Self>, buf: &mut [u8]) -> ImageResult<()> {
-        (*self).read_image(buf)
+        Ok(DecodedImageAttributes::default())
     }
 }
 

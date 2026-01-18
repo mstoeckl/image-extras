@@ -11,19 +11,35 @@
 //! * <https://www.openraster.org/> - OpenRaster specification
 
 use image::codecs::png::PngDecoder;
-use image::error::{DecodingError, ImageFormatHint, UnsupportedError};
+use image::error::{
+    DecodingError, ImageFormatHint, ParameterError, ParameterErrorKind, UnsupportedError,
+};
+use image::io::{DecodedImageAttributes, DecoderAttributes};
 use image::metadata::Orientation;
-use image::{ColorType, ExtendedColorType, ImageDecoder, ImageError, ImageResult, Limits};
+use image::{
+    ColorType, ExtendedColorType, ImageDecoder, ImageError, ImageLayout, ImageResult, Limits,
+};
 use ouroboros::self_referencing;
-use std::io::{self, BufReader, Read, Seek};
+use std::io::{self, BufReader, Cursor, Read, Seek};
 use std::marker::PhantomData;
 use zip::read::{ZipArchive, ZipFile};
+
+enum OraState<'a, R>
+where
+    R: Read + Seek + 'a,
+{
+    Init(R),
+    Main(PngDecoder<BufReader<SeekableArchiveFile<'a, R>>>),
+    /// Null state, used if the transition from Init to Main fails
+    Failed,
+}
 
 pub struct OpenRasterDecoder<'a, R>
 where
     R: Read + Seek + 'a,
 {
-    mergedimg_decoder: PngDecoder<BufReader<SeekableArchiveFile<'a, R>>>,
+    state: OraState<'a, R>,
+    limits: Option<Limits>,
 }
 
 fn openraster_format_hint() -> ImageFormatHint {
@@ -146,102 +162,156 @@ impl<'a, R> OpenRasterDecoder<'a, R>
 where
     R: Read + Seek + 'a,
 {
-    /// Create a new `OpenRasterDecoder` with the provided limits.
-    ///
-    /// (Limits need to be specified in advance, because determining the
-    /// minimum information needed for the ImageDecoder trait (image size and
-    /// color type) may require reading through and remembering image-dependent
-    /// amount of data.)
+    /// Create a new `OpenRasterDecoder`
     ///
     /// Warning: While decoding limits apply to the header parsing and decoding
     /// of the merged imaged component (a PNG file inside the ZIP archive that
     /// forms an OpenRaster file), memory constraints on the ZIP file decoding
     /// process have not yet been implemented; input ZIP files with very many
     /// entries may require significant amounts of memory to read.
-    pub fn with_limits(r: R, limits: Limits) -> Result<OpenRasterDecoder<'a, R>, ImageError> {
-        let mut archive = ZipArchive::new(r)
-            .map_err(|e| ImageError::Decoding(DecodingError::new(openraster_format_hint(), e)))?;
-
-        /* Verify that this _is_ an OpenRaster file, and not some unrelated ZIP archive */
-        let mimetype_index = archive.index_for_name("mimetype").ok_or_else(|| {
-            ImageError::Decoding(DecodingError::new(
-                openraster_format_hint(),
-                "OpenRaster images should contain a mimetype subfile",
-            ))
-        })?;
-
-        let mut mimetype_file = archive
-            .by_index(mimetype_index)
-            .map_err(|x| ImageError::Decoding(DecodingError::new(openraster_format_hint(), x)))?;
-
-        const EXPECTED_MIMETYPE: &str = "image/openraster";
-        let mut tmp = [0u8; EXPECTED_MIMETYPE.len()];
-
-        mimetype_file.read_exact(&mut tmp)?;
-
-        if tmp != EXPECTED_MIMETYPE.as_bytes()
-            || mimetype_file.size() != EXPECTED_MIMETYPE.len() as u64
-        {
-            return Err(ImageError::Decoding(DecodingError::new(
-                openraster_format_hint(),
-                "Image did not have correct mimetype subentry to be identified as OpenRaster",
-            )));
+    pub fn new(r: R) -> OpenRasterDecoder<'a, R> {
+        OpenRasterDecoder {
+            state: OraState::Init(r),
+            limits: None,
         }
-
-        drop(mimetype_file);
-
-        let mergedimage_index = archive.index_for_name("mergedimage.png").ok_or_else(|| {
-            ImageError::Decoding(DecodingError::new(
-                openraster_format_hint(),
-                "OpenRaster image missing mergedimage.png entry",
-            ))
-        })?;
-
-        let file = SeekableArchiveFile::new(archive, mergedimage_index)?;
-        let decoder =
-            PngDecoder::with_limits(BufReader::new(file), limits).map_err(set_ora_image_type)?;
-
-        Ok(OpenRasterDecoder {
-            mergedimg_decoder: decoder,
-        })
     }
 }
 
 impl<'a, R: Read + Seek + 'a> ImageDecoder for OpenRasterDecoder<'a, R> {
-    fn dimensions(&self) -> (u32, u32) {
-        self.mergedimg_decoder.dimensions()
+    fn peek_layout(&mut self) -> ImageResult<ImageLayout> {
+        if matches!(self.state, OraState::Init(_)) {
+            let OraState::Init(r) = std::mem::replace(&mut self.state, OraState::Failed) else {
+                unreachable!();
+            };
+
+            let mut archive = ZipArchive::new(r).map_err(|e| {
+                ImageError::Decoding(DecodingError::new(openraster_format_hint(), e))
+            })?;
+
+            /* Verify that this _is_ an OpenRaster file, and not some unrelated ZIP archive */
+            let mimetype_index = archive.index_for_name("mimetype").ok_or_else(|| {
+                ImageError::Decoding(DecodingError::new(
+                    openraster_format_hint(),
+                    "OpenRaster images should contain a mimetype subfile",
+                ))
+            })?;
+
+            let mut mimetype_file = archive.by_index(mimetype_index).map_err(|x| {
+                ImageError::Decoding(DecodingError::new(openraster_format_hint(), x))
+            })?;
+
+            const EXPECTED_MIMETYPE: &str = "image/openraster";
+            let mut tmp = [0u8; EXPECTED_MIMETYPE.len()];
+
+            mimetype_file.read_exact(&mut tmp)?;
+
+            if tmp != EXPECTED_MIMETYPE.as_bytes()
+                || mimetype_file.size() != EXPECTED_MIMETYPE.len() as u64
+            {
+                return Err(ImageError::Decoding(DecodingError::new(
+                    openraster_format_hint(),
+                    "Image did not have correct mimetype subentry to be identified as OpenRaster",
+                )));
+            }
+
+            drop(mimetype_file);
+
+            let mergedimage_index = archive.index_for_name("mergedimage.png").ok_or_else(|| {
+                ImageError::Decoding(DecodingError::new(
+                    openraster_format_hint(),
+                    "OpenRaster image missing mergedimage.png entry",
+                ))
+            })?;
+
+            let file = SeekableArchiveFile::new(archive, mergedimage_index)?;
+            let decoder = if let Some(limits) = self.limits.take() {
+                PngDecoder::with_limits(BufReader::new(file), limits)
+            } else {
+                PngDecoder::new(BufReader::new(file))
+            };
+
+            self.state = OraState::Main(decoder);
+        }
+
+        let OraState::Main(decoder) = &mut self.state else {
+            return Err(ImageError::Parameter(ParameterError::from_kind(
+                ParameterErrorKind::NoMoreData,
+            )));
+        };
+        decoder.peek_layout().map_err(set_ora_image_type)
     }
 
-    fn color_type(&self) -> ColorType {
-        self.mergedimg_decoder.color_type()
+    fn original_color_type(&mut self) -> ImageResult<ExtendedColorType> {
+        let OraState::Main(decoder) = &mut self.state else {
+            return Err(ImageError::Parameter(ParameterError::from_kind(
+                ParameterErrorKind::Generic("Need to call peek_layout() first".into()),
+            )));
+        };
+        decoder.original_color_type().map_err(set_ora_image_type)
     }
 
-    fn original_color_type(&self) -> ExtendedColorType {
-        self.mergedimg_decoder.original_color_type()
+    fn attributes(&self) -> DecoderAttributes {
+        // TODO: This is a hack; consider hard coding attributes
+        let empty = Cursor::new(&[]);
+        let mut attrib = PngDecoder::new(empty).attributes();
+        // The previous image should have only one part
+        attrib.is_animated = false;
+        attrib.is_sequence = false;
+        attrib
     }
 
     fn set_limits(&mut self, limits: Limits) -> ImageResult<()> {
         // Warning: this does not account for any ZIP reading overhead
-        self.mergedimg_decoder.set_limits(limits)
+        if let OraState::Main(decoder) = &mut self.state {
+            decoder.set_limits(limits)?;
+        } else {
+            self.limits = Some(limits);
+        }
+        Ok(())
     }
 
     fn icc_profile(&mut self) -> ImageResult<Option<Vec<u8>>> {
-        self.mergedimg_decoder.icc_profile()
+        let OraState::Main(decoder) = &mut self.state else {
+            return Err(ImageError::Parameter(ParameterError::from_kind(
+                ParameterErrorKind::Generic("Need to call peek_layout() first".into()),
+            )));
+        };
+        decoder.icc_profile().map_err(set_ora_image_type)
     }
 
     fn exif_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
-        self.mergedimg_decoder.exif_metadata()
+        let OraState::Main(decoder) = &mut self.state else {
+            return Err(ImageError::Parameter(ParameterError::from_kind(
+                ParameterErrorKind::Generic("Need to call peek_layout() first".into()),
+            )));
+        };
+        decoder.exif_metadata().map_err(set_ora_image_type)
     }
 
-    fn orientation(&mut self) -> ImageResult<Orientation> {
-        self.mergedimg_decoder.orientation()
+    fn xmp_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
+        let OraState::Main(decoder) = &mut self.state else {
+            return Err(ImageError::Parameter(ParameterError::from_kind(
+                ParameterErrorKind::Generic("Need to call peek_layout() first".into()),
+            )));
+        };
+        decoder.xmp_metadata().map_err(set_ora_image_type)
     }
 
-    fn read_image(self, buf: &mut [u8]) -> ImageResult<()> {
-        self.mergedimg_decoder.read_image(buf)
+    fn iptc_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
+        let OraState::Main(decoder) = &mut self.state else {
+            return Err(ImageError::Parameter(ParameterError::from_kind(
+                ParameterErrorKind::Generic("Need to call peek_layout() first".into()),
+            )));
+        };
+        decoder.iptc_metadata().map_err(set_ora_image_type)
     }
 
-    fn read_image_boxed(self: Box<Self>, buf: &mut [u8]) -> ImageResult<()> {
-        (*self).read_image(buf)
+    fn read_image(&mut self, buf: &mut [u8]) -> ImageResult<DecodedImageAttributes> {
+        self.peek_layout()?;
+        let OraState::Main(decoder) = &mut self.state else {
+            unreachable!();
+        };
+        decoder.read_image(buf).map_err(set_ora_image_type)
+        // TODO: mark self.state so that, if the PNG images has APNG frames, the decoder rejects them
     }
 }
